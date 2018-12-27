@@ -11,7 +11,17 @@ const base32 = require('base32.js');
 const Account = require('./models/account');
 const Block = require('./models/block');
 const Post = require('./models/post');
+const Interact = require('./models/interact');
 const Transaction = require('./models/transaction');
+const PlainTextContent = vstruct([
+  { name: 'type', type: vstruct.UInt8 },
+  { name: 'text', type: vstruct.VarString(vstruct.UInt16BE) }
+]);
+
+const ReactContent = vstruct([
+  { name: 'type', type: vstruct.UInt8 },
+  { name: 'reaction', type: vstruct.UInt8 }
+]);
 
 (async () => {
   try {
@@ -52,7 +62,6 @@ const Transaction = require('./models/transaction');
         const resp = await axios.get(
           `${config.PUBLIC_URL}/block?height=${+previosHeight}`
         );
-        console.log(resp.data);
 
         const res = _.get(resp, 'data.result');
         const { data, header } = _.get(res, 'block');
@@ -69,7 +78,6 @@ const Transaction = require('./models/transaction');
             console.log('Block' + previosHeight + 'is created');
           }
         );
-        console.log('chua xong ma');
 
         if (data && data.txs) {
           const txs = _.get(data, 'txs');
@@ -83,9 +91,8 @@ const Transaction = require('./models/transaction');
           });
         }
       } else {
-        pooling = 10000;
+        pooling = 0;
       }
-      console.log('fishshshhsh');
 
       setTimeout(syncData, pooling);
     }, pooling);
@@ -115,9 +122,7 @@ const executeTx = async (transaction, currentBlock) => {
     throw new Error('transaction is invalid');
   }
   // Check account
-  const account = await Account.findOne({ address: tx.account }, err => {
-    if (err) throw err;
-  });
+  const account = await Account.findOne({ address: tx.account });
   console.log(account);
 
   account.sequence = new Decimal(account.sequence).add(1).toFixed();
@@ -141,6 +146,7 @@ const executeTx = async (transaction, currentBlock) => {
     account.bandwidthTime = currentBlock.time;
     account.enegry = bandwidthLimit - account.bandwidth;
   }
+  await account.save();
 
   // Process operation
   if (operation === 'create_account') {
@@ -163,7 +169,14 @@ const executeTx = async (transaction, currentBlock) => {
         console.log('saved: ' + address);
       }
     );
-
+    await Interact.create({
+      hash: tx.hash,
+      author: account.address,
+      picture: account.info.picture,
+      name: account.info.name,
+      operation: operation,
+      params: tx.params
+    });
     console.log(`${tx.hash}: ${account.address} created ${address}`);
   } else if (operation === 'payment') {
     const { address, amount } = tx.params;
@@ -174,22 +187,29 @@ const executeTx = async (transaction, currentBlock) => {
     found.balance = new Decimal(found.balance).add(amount).toFixed();
     account.balance = new Decimal(account.balance).sub(amount).toFixed();
     await found.save();
-
+    await account.save();
+    await Interact.create({
+      hash: tx.hash,
+      author: account.address,
+      picture: account.info.picture,
+      name: account.info.name,
+      operation: operation,
+      params: tx.params
+    });
     console.log(
       `${tx.hash}: ${account.address} transfered ${amount} to ${address}`
     );
   } else if (operation === 'post') {
     const { content, keys } = tx.params;
-    const PlainTextContent = vstruct([
-      { name: 'type', type: vstruct.UInt8 },
-      { name: 'text', type: vstruct.VarString(vstruct.UInt16BE) }
-    ]);
 
     try {
       const data = PlainTextContent.decode(content);
       await Post.create(
         {
+          hash: tx.hash,
           author: account.address,
+          name: account.info.name,
+          picture: account.info.picture,
           content: data,
           keys
         },
@@ -197,6 +217,17 @@ const executeTx = async (transaction, currentBlock) => {
           if (err) throw err;
         }
       );
+      await Interact.create({
+        hash: tx.hash,
+        author: account.address,
+        picture: account.info.picture,
+        name: account.info.name,
+        operation: operation,
+        params: {
+          content: data,
+          keys
+        }
+      });
     } catch (e) {
       throw e;
     }
@@ -213,32 +244,84 @@ const executeTx = async (transaction, currentBlock) => {
         type: vstruct.VarArray(vstruct.UInt16BE, vstruct.Buffer(35))
       }
     ]);
-
+    let data;
     switch (key) {
       case 'name':
         account.info.name = value.toString('utf-8');
+        data = value.toString('utf-8');
         break;
       case 'picture':
         account.info.picture = value.toString('base64');
+        data = value.toString('base64');
         break;
       case 'followings':
         const follows = Followings.decode(value);
-        account.info.followings = follows.addresses.map(f => base32.encode(f));
+        const newfollowings = follows.addresses.map(f => base32.encode(f));
+        account.info.followings = newfollowings;
+        data = newfollowings;
         break;
     }
-
+    console.log(key);
+    console.log(data);
+    
+    const i = await Interact.create({
+      hash: tx.hash,
+      author: account.address,
+      picture: account.info.picture,
+      name: account.info.name,
+      operation: operation,
+      params: {
+        key: key,
+        value: data
+      }
+    });
+    console.log(i);
+    
+    await account.save();
     console.log(
       `${tx.hash}: ${account.address} update ${key} with ${value.length} bytes`
     );
   } else if (operation === 'interact') {
-    // const { object, content } = tx.params;
     // Check if object exists
-    // const transaction = await Transaction.findByPk(object, { transaction: dbTransaction });
-    // if (!transaction) {
-    // throw Error('Object does not exist');
-    // }
-    // tx.params.address = transaction.author;
-    // console.log(`${tx.hash}: ${account.address} interact ${object} with ${content.length} bytes`);
+    try {
+      const { object, content } = tx.params;
+     
+      // const interact = await Interact.findOne({ hash: object });
+      // if (!interact) {
+      //   throw Error('Object does not exist');
+      // }
+      const post = await Post.findOne({ hash: object });
+      const { type, reaction } = ReactContent.decode(content);
+      const found = await Account.findOne({ address: account.address });
+
+      const {
+        address,
+        info: { picture, name }
+      } = found;
+      if (type === 1) {
+        const { text } = PlainTextContent.decode(content);
+        const comments = { text, author: address, picture, name };
+        post.comments = [...post.comments, comments];
+        // interact.comments = [...interact.comments, comments];
+      } else if (type === 2) {
+        const reacts = { reaction, author: address, picture, name };
+        post.reacts = [...post.reacts, reacts];
+        // interact.reacts = [...reacts.comments, comments];
+      } else {
+        throw new Error('react type not found');
+      }
+
+      await post.save();
+      // await interact.save();
+
+      console.log(
+        `${tx.hash}: ${account.address} interact ${object} with ${
+          content.length
+        } bytes`
+      );
+    } catch (e) {
+      throw e;
+    }
   } else {
     throw Error('Operation is not support.');
   }
@@ -253,9 +336,6 @@ const executeTx = async (transaction, currentBlock) => {
       'Account balance must greater blocked amount due to bandwidth used'
     );
   }
-  await account.save(err => {
-    if (err) throw err;
-  });
   // Add transaction to db
   await Transaction.create(
     {
